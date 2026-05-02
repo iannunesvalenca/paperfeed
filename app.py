@@ -5,8 +5,10 @@ import time
 from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from html.parser import HTMLParser
 from typing import Optional
 import xml.etree.ElementTree as ET
+from urllib.parse import urljoin
 
 import httpx
 import feedparser
@@ -71,6 +73,9 @@ def load_config() -> Config:
 
 CACHE_TTL_SECONDS = 300
 _CACHE = {"timestamp": 0.0, "key": None, "papers": None}
+PREVIEW_CACHE_TTL_SECONDS = 86400
+PREVIEW_FETCH_LIMIT = 12
+_PREVIEW_CACHE: dict[str, tuple[float, str]] = {}
 
 # === Paper Model ===
 
@@ -85,6 +90,8 @@ class Paper:
     journal: str = ""
     matched_areas: list[str] = field(default_factory=list)
     score: float = 0.0
+    image_url: str = ""
+    preview_url: str = ""
 
 # === Collectors ===
 
@@ -233,6 +240,12 @@ def _parse_pubmed_article(article: ET.Element) -> Optional[Paper]:
     pmid_elem = medline.find(".//PMID")
     pmid = pmid_elem.text if pmid_elem is not None else ""
     url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else ""
+    doi = ""
+    for article_id in article.findall(".//ArticleIdList/ArticleId"):
+        if article_id.attrib.get("IdType") == "doi" and article_id.text:
+            doi = article_id.text.strip()
+            break
+    preview_url = f"https://doi.org/{doi}" if doi else url
     journal_title_elem = article_elem.find(".//Journal/Title")
     journal_title = "".join(journal_title_elem.itertext()).strip() if journal_title_elem is not None else ""
 
@@ -245,6 +258,7 @@ def _parse_pubmed_article(article: ET.Element) -> Optional[Paper]:
         published_date=published,
         source="pubmed",
         journal=journal_title,
+        preview_url=preview_url,
     )
 
 def _parse_pubmed_date(article_elem: ET.Element, medline: ET.Element) -> date:
@@ -346,6 +360,7 @@ async def fetch_biorxiv(days: int, max_results: int, client: httpx.AsyncClient) 
                     published_date=date.fromisoformat(item.get("date", str(date.today()))),
                     source="biorxiv",
                     journal="bioRxiv",
+                    preview_url=f"https://doi.org/{doi}" if doi else "",
                 ))
             except Exception:
                 continue
@@ -397,6 +412,7 @@ async def fetch_arxiv(days: int, max_results: int, categories: list[str], client
                     published_date=pub_date,
                     source="arxiv",
                     journal="arXiv",
+                    preview_url=entry.get("link", ""),
                 ))
             except Exception:
                 continue
@@ -469,6 +485,66 @@ def _collect_search_terms(config: Config) -> list[str]:
             seen.add(cleaned.lower())
             terms.append(cleaned)
     return terms
+
+# === Preview Images ===
+
+class OpenGraphImageParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.image_url = ""
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]):
+        if tag.lower() != "meta" or self.image_url:
+            return
+
+        attr_map = {key.lower(): value for key, value in attrs if key and value}
+        name = (attr_map.get("property") or attr_map.get("name") or "").lower()
+        if name in {"og:image", "og:image:url", "twitter:image", "twitter:image:src"}:
+            self.image_url = attr_map.get("content", "").strip()
+
+async def enrich_preview_images(papers: list[Paper], client: httpx.AsyncClient, limit: int = PREVIEW_FETCH_LIMIT) -> None:
+    candidates = [paper for paper in papers if paper.preview_url or paper.url][:limit]
+    if not candidates:
+        return
+
+    await asyncio.gather(*(_enrich_preview_image(paper, client) for paper in candidates))
+
+async def _enrich_preview_image(paper: Paper, client: httpx.AsyncClient) -> None:
+    lookup_url = paper.preview_url or paper.url
+    cached = _PREVIEW_CACHE.get(lookup_url)
+    now = time.time()
+    if cached and (now - cached[0]) < PREVIEW_CACHE_TTL_SECONDS:
+        paper.image_url = cached[1]
+        return
+
+    image_url = ""
+    try:
+        resp = await client.get(
+            lookup_url,
+            follow_redirects=True,
+            headers={"User-Agent": "PaperFeed/1.0"},
+        )
+        resp.raise_for_status()
+        parser = OpenGraphImageParser()
+        parser.feed(resp.text[:200000])
+        if parser.image_url:
+            image_url = urljoin(str(resp.url), parser.image_url)
+            if _is_generic_preview_image(image_url):
+                image_url = ""
+    except Exception as e:
+        print(f"Preview image error for {lookup_url}: {e}")
+
+    _PREVIEW_CACHE[lookup_url] = (now, image_url)
+    paper.image_url = image_url
+
+def _is_generic_preview_image(image_url: str) -> bool:
+    generic_fragments = (
+        "pubmed-meta-image",
+        "ncbi.nlm.nih.gov/pubmed",
+        "arxiv-logo",
+    )
+    lowered = image_url.lower()
+    return any(fragment in lowered for fragment in generic_fragments)
 
 # === Main Fetch Function ===
 
@@ -766,6 +842,26 @@ HTML_TEMPLATE = """
             transform: translateY(0) rotateX(0);
         }
 
+        .paper-layout {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) 140px;
+            gap: 1rem;
+            align-items: start;
+        }
+
+        .paper-content {
+            min-width: 0;
+        }
+
+        .paper-preview {
+            width: 140px;
+            aspect-ratio: 4 / 3;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+            object-fit: cover;
+            background: var(--bg-secondary);
+        }
+
         .paper-header {
             display: flex;
             justify-content: space-between;
@@ -894,6 +990,11 @@ HTML_TEMPLATE = """
                 gap: 0.5rem;
             }
             select, button { width: 100%; }
+            .paper-layout { grid-template-columns: 1fr; }
+            .paper-preview {
+                width: 100%;
+                max-height: 180px;
+            }
             .paper-header { flex-direction: column; gap: 0.5rem; }
             .score { align-self: flex-start; }
             .authors { max-width: 100%; }
@@ -941,28 +1042,35 @@ HTML_TEMPLATE = """
                 {% if high_impact_papers %}
                     {% for paper in high_impact_papers %}
                     <article class="paper" style="--area-color: var(--area-{{ paper.matched_areas[0] if paper.matched_areas else 'default' }}, var(--accent))">
-                        <div class="paper-header">
-                            <a href="{{ paper.url }}" target="_blank" rel="noopener" class="paper-title">
-                                {{ paper.title }}
-                            </a>
-                            <span class="score">{{ paper.score }}</span>
-                        </div>
-                        <div class="paper-meta">
-                            <span class="source-badge source-{{ paper.source }}">{{ paper.source }}</span>
-                            {% if paper.journal %}
-                            <span class="journal">{{ paper.journal }}</span>
+                        <div class="paper-layout">
+                            <div class="paper-content">
+                                <div class="paper-header">
+                                    <a href="{{ paper.url }}" target="_blank" rel="noopener" class="paper-title">
+                                        {{ paper.title }}
+                                    </a>
+                                    <span class="score">{{ paper.score }}</span>
+                                </div>
+                                <div class="paper-meta">
+                                    <span class="source-badge source-{{ paper.source }}">{{ paper.source }}</span>
+                                    {% if paper.journal %}
+                                    <span class="journal">{{ paper.journal }}</span>
+                                    {% endif %}
+                                    <span class="authors">{{ paper.authors }}</span>
+                                    <span class="date">{{ paper.published_date }}</span>
+                                </div>
+                                {% if paper.matched_areas %}
+                                <div class="areas">
+                                    {% for a in paper.matched_areas %}
+                                    <span class="area-tag area-{{ a }}">{{ a.replace('_', ' ') }}</span>
+                                    {% endfor %}
+                                </div>
+                                {% endif %}
+                                <p class="abstract">{{ paper.abstract }}</p>
+                            </div>
+                            {% if paper.image_url %}
+                            <img class="paper-preview" src="{{ paper.image_url }}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()">
                             {% endif %}
-                            <span class="authors">{{ paper.authors }}</span>
-                            <span class="date">{{ paper.published_date }}</span>
                         </div>
-                        {% if paper.matched_areas %}
-                        <div class="areas">
-                            {% for a in paper.matched_areas %}
-                            <span class="area-tag area-{{ a }}">{{ a.replace('_', ' ') }}</span>
-                            {% endfor %}
-                        </div>
-                        {% endif %}
-                        <p class="abstract">{{ paper.abstract }}</p>
                     </article>
                     {% endfor %}
                 {% else %}
@@ -976,28 +1084,35 @@ HTML_TEMPLATE = """
             <div class="papers">
                 {% for paper in other_papers %}
                 <article class="paper" style="--area-color: var(--area-{{ paper.matched_areas[0] if paper.matched_areas else 'default' }}, var(--accent))">
-                    <div class="paper-header">
-                        <a href="{{ paper.url }}" target="_blank" rel="noopener" class="paper-title">
-                            {{ paper.title }}
-                        </a>
-                        <span class="score">{{ paper.score }}</span>
-                    </div>
-                    <div class="paper-meta">
-                        <span class="source-badge source-{{ paper.source }}">{{ paper.source }}</span>
-                        {% if paper.journal %}
-                        <span class="journal">{{ paper.journal }}</span>
+                    <div class="paper-layout">
+                        <div class="paper-content">
+                            <div class="paper-header">
+                                <a href="{{ paper.url }}" target="_blank" rel="noopener" class="paper-title">
+                                    {{ paper.title }}
+                                </a>
+                                <span class="score">{{ paper.score }}</span>
+                            </div>
+                            <div class="paper-meta">
+                                <span class="source-badge source-{{ paper.source }}">{{ paper.source }}</span>
+                                {% if paper.journal %}
+                                <span class="journal">{{ paper.journal }}</span>
+                                {% endif %}
+                                <span class="authors">{{ paper.authors }}</span>
+                                <span class="date">{{ paper.published_date }}</span>
+                            </div>
+                            {% if paper.matched_areas %}
+                            <div class="areas">
+                                {% for a in paper.matched_areas %}
+                                <span class="area-tag area-{{ a }}">{{ a.replace('_', ' ') }}</span>
+                                {% endfor %}
+                            </div>
+                            {% endif %}
+                            <p class="abstract">{{ paper.abstract }}</p>
+                        </div>
+                        {% if paper.image_url %}
+                        <img class="paper-preview" src="{{ paper.image_url }}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()">
                         {% endif %}
-                        <span class="authors">{{ paper.authors }}</span>
-                        <span class="date">{{ paper.published_date }}</span>
                     </div>
-                    {% if paper.matched_areas %}
-                    <div class="areas">
-                        {% for a in paper.matched_areas %}
-                        <span class="area-tag area-{{ a }}">{{ a.replace('_', ' ') }}</span>
-                        {% endfor %}
-                    </div>
-                    {% endif %}
-                    <p class="abstract">{{ paper.abstract }}</p>
                 </article>
                 {% endfor %}
             </div>
@@ -1063,6 +1178,9 @@ async def index(
         p for p in papers
         if (not is_high_impact(p, config)) and p.published_date >= other_cutoff
     ]
+
+    async with httpx.AsyncClient(timeout=4.0) as client:
+        await enrich_preview_images(high_impact_papers + other_papers, client)
 
     env = Environment(autoescape=select_autoescape(["html", "xml"]))
     template = env.from_string(HTML_TEMPLATE)
