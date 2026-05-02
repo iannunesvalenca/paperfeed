@@ -38,7 +38,7 @@ class Config:
     other_lookback_options: list[int]
 
 def load_config() -> Config:
-    config_path = Path(__file__).parent.parent / "config.yaml"
+    config_path = Path(__file__).parent / "config.yaml"
     with open(config_path) as f:
         raw = yaml.safe_load(f)
 
