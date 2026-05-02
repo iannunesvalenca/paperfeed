@@ -116,9 +116,17 @@ def _fetch_pubmed_sync(
     try:
         # Search for IDs
         term_query = _build_pubmed_query(terms=terms, date_range=date_range, journals=journals)
-        search_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term={urllib.parse.quote(term_query)}&retmax={max_results}&retmode=json&sort=pub_date"
+        search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+        search_data = urllib.parse.urlencode({
+            "db": "pubmed",
+            "term": term_query,
+            "retmax": max_results,
+            "retmode": "json",
+            "sort": "pub_date",
+        }).encode("utf-8")
+        search_req = urllib.request.Request(search_url, data=search_data, method="POST")
 
-        with urllib.request.urlopen(search_url, timeout=20) as resp:
+        with urllib.request.urlopen(search_req, timeout=20) as resp:
             data = json.loads(resp.read())
             ids = data.get("esearchresult", {}).get("idlist", [])
 
@@ -126,9 +134,15 @@ def _fetch_pubmed_sync(
             return papers
 
         # Fetch details
-        fetch_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pubmed&id={','.join(ids[:max_results])}&retmode=xml"
+        fetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+        fetch_data = urllib.parse.urlencode({
+            "db": "pubmed",
+            "id": ",".join(ids[:max_results]),
+            "retmode": "xml",
+        }).encode("utf-8")
+        fetch_req = urllib.request.Request(fetch_url, data=fetch_data, method="POST")
 
-        with urllib.request.urlopen(fetch_url, timeout=20) as resp:
+        with urllib.request.urlopen(fetch_req, timeout=20) as resp:
             xml_text = resp.read().decode("utf-8")
 
         root = ET.fromstring(xml_text)
@@ -255,7 +269,24 @@ def _parse_pubmed_date(article_elem: ET.Element, medline: ET.Element) -> date:
         if parsed:
             return parsed
 
+        medline_date = pub_date.findtext("MedlineDate")
+        parsed = _date_from_medline_text(medline_date)
+        if parsed:
+            return parsed
+
     return date.today()
+
+def _date_from_medline_text(value: Optional[str]) -> Optional[date]:
+    if not value:
+        return None
+
+    parts = value.replace("-", " ").split()
+    year = next((part for part in parts if part.isdigit() and len(part) == 4), None)
+    month = next((part for part in parts if part[:3].lower() in {
+        "jan", "feb", "mar", "apr", "may", "jun",
+        "jul", "aug", "sep", "oct", "nov", "dec",
+    }), None)
+    return _date_from_parts(year, month, None)
 
 def _date_from_parts(year: Optional[str], month: Optional[str], day: Optional[str]) -> Optional[date]:
     if not year:
@@ -329,7 +360,7 @@ async def fetch_arxiv(days: int, max_results: int, categories: list[str], client
 
     try:
         cat_query = " OR ".join(f"cat:{cat}" for cat in categories)
-        url = "http://export.arxiv.org/api/query"
+        url = "https://export.arxiv.org/api/query"
         params = {
             "search_query": f"({cat_query})",
             "start": 0,
@@ -514,8 +545,8 @@ async def fetch_all_papers_for_days(config: Config, lookback_days: int, high_imp
     scored = [score_paper(p, config) for p in all_papers]
     relevant = [p for p in scored if p.score > 0]
 
-    # Sort by score descending
-    relevant.sort(key=lambda p: (-p.score, p.published_date), reverse=False)
+    # Sort by score descending, then newest first.
+    relevant.sort(key=lambda p: (p.score, p.published_date), reverse=True)
 
     _CACHE["timestamp"] = now
     _CACHE["key"] = cache_key
@@ -551,11 +582,11 @@ HTML_TEMPLATE = """
 
             /* Area colors */
             --area-metagenomics: #3fb950;
-            --area-viruses: #f85149;
+            --area-viruses_outbreaks: #f85149;
             --area-ngs: #a371f7;
-            --area-ai: #79c0ff;
-            --area-genome: #ffa657;
-            --area-bioinfo: #ff7b72;
+            --area-ai_ml: #79c0ff;
+            --area-human_genome: #ffa657;
+            --area-bioinformatics: #ff7b72;
 
             /* Source colors */
             --pubmed: #4493f8;
@@ -825,11 +856,11 @@ HTML_TEMPLATE = """
         }
 
         .area-metagenomics { background: rgba(63, 185, 80, 0.15); color: var(--area-metagenomics); }
-        .area-viruses_outbreaks { background: rgba(248, 81, 73, 0.15); color: var(--area-viruses); }
+        .area-viruses_outbreaks { background: rgba(248, 81, 73, 0.15); color: var(--area-viruses_outbreaks); }
         .area-ngs { background: rgba(163, 113, 247, 0.15); color: var(--area-ngs); }
-        .area-ai_ml { background: rgba(121, 192, 255, 0.15); color: var(--area-ai); }
-        .area-human_genome { background: rgba(255, 166, 87, 0.15); color: var(--area-genome); }
-        .area-bioinformatics { background: rgba(255, 123, 114, 0.15); color: var(--area-bioinfo); }
+        .area-ai_ml { background: rgba(121, 192, 255, 0.15); color: var(--area-ai_ml); }
+        .area-human_genome { background: rgba(255, 166, 87, 0.15); color: var(--area-human_genome); }
+        .area-bioinformatics { background: rgba(255, 123, 114, 0.15); color: var(--area-bioinformatics); }
 
         .abstract {
             font-size: 0.9rem;
@@ -1019,7 +1050,7 @@ async def index(
     if sort == "date":
         papers.sort(key=lambda p: p.published_date, reverse=True)
     else:
-        papers.sort(key=lambda p: p.score, reverse=True)
+        papers.sort(key=lambda p: (p.score, p.published_date), reverse=True)
 
     today = date.today()
     high_cutoff = today - timedelta(days=config.high_impact_lookback_days)
