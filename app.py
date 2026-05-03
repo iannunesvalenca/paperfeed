@@ -72,6 +72,8 @@ def load_config() -> Config:
 CACHE_TTL_SECONDS = 300
 _CACHE = {"timestamp": 0.0, "key": None, "papers": None}
 DISPLAY_LIMIT = 20
+TOPIC_AREAS = ("metagenomics", "viruses_outbreaks", "human_genome")
+METHOD_AREAS = ("ngs", "ai_ml", "bioinformatics")
 
 # === Paper Model ===
 
@@ -470,6 +472,13 @@ def _collect_search_terms(config: Config) -> list[str]:
             seen.add(cleaned.lower())
             terms.append(cleaned)
     return terms
+
+def _area_label(area_name: str) -> str:
+    labels = {
+        "ai_ml": "AI / ML",
+        "ngs": "NGS",
+    }
+    return labels.get(area_name, area_name.replace("_", " ").title())
 
 # === Main Fetch Function ===
 
@@ -949,11 +958,22 @@ HTML_TEMPLATE = """
         </header>
 
         <form class="controls" method="get">
-            <select name="area">
-                <option value="">All areas</option>
-                {% for a in areas %}
-                <option value="{{ a }}" {% if area == a %}selected{% endif %}>{{ a.replace('_', ' ').title() }}</option>
+            <select name="topic">
+                <option value="">All topics</option>
+                {% for t in topics %}
+                <option value="{{ t.name }}" {% if topic == t.name %}selected{% endif %}>{{ t.label }}</option>
                 {% endfor %}
+            </select>
+            <select name="method">
+                <option value="">Any method</option>
+                {% for m in methods %}
+                <option value="{{ m.name }}" {% if method == m.name %}selected{% endif %}>{{ m.label }}</option>
+                {% endfor %}
+            </select>
+            <select name="scope">
+                <option value="high_impact_first" {% if scope == 'high_impact_first' %}selected{% endif %}>High-impact first</option>
+                <option value="high_impact_only" {% if scope == 'high_impact_only' %}selected{% endif %}>High-impact only</option>
+                <option value="all" {% if scope == 'all' %}selected{% endif %}>All ranked papers</option>
             </select>
             <select name="source">
                 <option value="">All sources</option>
@@ -1065,7 +1085,9 @@ HTML_TEMPLATE = """
 @app.get("/", response_class=HTMLResponse)
 async def index(
     request: Request,
-    area: str = Query(""),
+    topic: str = Query(""),
+    method: str = Query(""),
+    scope: str = Query("high_impact_first"),
     source: str = Query(""),
     sort: str = Query("score"),
     days: int = Query(7),
@@ -1073,12 +1095,20 @@ async def index(
     config = load_config()
     if days not in config.other_lookback_options:
         days = config.lookback_days
+    if topic not in TOPIC_AREAS:
+        topic = ""
+    if method not in METHOD_AREAS:
+        method = ""
+    if scope not in {"high_impact_first", "high_impact_only", "all"}:
+        scope = "high_impact_first"
 
     papers = await fetch_all_papers_for_days(config, days, config.high_impact_lookback_days)
 
-    # Filter by area
-    if area:
-        papers = [p for p in papers if area in p.matched_areas]
+    # Filter by topic and method independently.
+    if topic:
+        papers = [p for p in papers if topic in p.matched_areas]
+    if method:
+        papers = [p for p in papers if method in p.matched_areas]
 
     # Filter by source
     if source:
@@ -1093,17 +1123,45 @@ async def index(
     today = date.today()
     high_cutoff = today - timedelta(days=config.high_impact_lookback_days)
     other_cutoff = today - timedelta(days=days)
-    high_impact_papers = []
-    other_papers = []
-    for paper in papers:
-        if len(high_impact_papers) + len(other_papers) >= DISPLAY_LIMIT:
-            break
-        if is_high_impact(paper, config) and paper.published_date >= high_cutoff:
-            high_impact_papers.append(paper)
-        elif (not is_high_impact(paper, config)) and paper.published_date >= other_cutoff:
-            other_papers.append(paper)
+    high_candidates = [
+        paper for paper in papers
+        if is_high_impact(paper, config) and paper.published_date >= high_cutoff
+    ]
+    other_candidates = [
+        paper for paper in papers
+        if (not is_high_impact(paper, config)) and paper.published_date >= other_cutoff
+    ]
+
+    if scope == "high_impact_only":
+        high_impact_papers = high_candidates[:DISPLAY_LIMIT]
+        other_papers = []
+    elif scope == "all":
+        displayed = []
+        for paper in papers:
+            if is_high_impact(paper, config) and paper.published_date >= high_cutoff:
+                displayed.append(paper)
+            elif (not is_high_impact(paper, config)) and paper.published_date >= other_cutoff:
+                displayed.append(paper)
+            if len(displayed) >= DISPLAY_LIMIT:
+                break
+        high_impact_papers = [paper for paper in displayed if is_high_impact(paper, config)]
+        other_papers = [paper for paper in displayed if not is_high_impact(paper, config)]
+    else:
+        high_impact_papers = high_candidates[:DISPLAY_LIMIT]
+        remaining_slots = DISPLAY_LIMIT - len(high_impact_papers)
+        other_papers = other_candidates[:remaining_slots]
 
     displayed_papers = high_impact_papers + other_papers
+    topic_options = [
+        {"name": name, "label": _area_label(name)}
+        for name in TOPIC_AREAS
+        if name in config.areas
+    ]
+    method_options = [
+        {"name": name, "label": _area_label(name)}
+        for name in METHOD_AREAS
+        if name in config.areas
+    ]
 
     env = Environment(autoescape=select_autoescape(["html", "xml"]))
     template = env.from_string(HTML_TEMPLATE)
@@ -1111,8 +1169,11 @@ async def index(
         papers=displayed_papers,
         high_impact_papers=high_impact_papers,
         other_papers=other_papers,
-        areas=list(config.areas.keys()),
-        area=area,
+        topics=topic_options,
+        methods=method_options,
+        topic=topic,
+        method=method,
+        scope=scope,
         source=source,
         sort=sort,
         days=days,
