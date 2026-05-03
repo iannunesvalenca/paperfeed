@@ -72,8 +72,6 @@ def load_config() -> Config:
 CACHE_TTL_SECONDS = 300
 _CACHE = {"timestamp": 0.0, "key": None, "papers": None}
 DISPLAY_LIMIT = 20
-TOPIC_AREAS = ("metagenomics", "viruses_outbreaks", "human_genome")
-METHOD_AREAS = ("ngs", "ai_ml", "bioinformatics")
 
 # === Paper Model ===
 
@@ -756,6 +754,17 @@ HTML_TEMPLATE = """
             transform: translateY(0);
         }
 
+        .secondary-button {
+            background: transparent;
+            color: var(--text-secondary);
+            border: 1px solid var(--border);
+        }
+
+        .secondary-button:hover {
+            background: var(--card-hover);
+            color: var(--text);
+        }
+
         .papers {
             display: flex;
             flex-direction: column;
@@ -957,17 +966,17 @@ HTML_TEMPLATE = """
             <div class="stats">{{ papers|length }} papers</div>
         </header>
 
-        <form class="controls" method="get">
+        <form class="controls" method="get" id="filter-form">
             <select name="topic">
-                <option value="">All topics</option>
-                {% for t in topics %}
-                <option value="{{ t.name }}" {% if topic == t.name %}selected{% endif %}>{{ t.label }}</option>
+                <option value="">Any interest</option>
+                {% for a in area_options %}
+                <option value="{{ a.name }}" {% if topic == a.name %}selected{% endif %}>{{ a.label }}</option>
                 {% endfor %}
             </select>
             <select name="method">
-                <option value="">Any method</option>
-                {% for m in methods %}
-                <option value="{{ m.name }}" {% if method == m.name %}selected{% endif %}>{{ m.label }}</option>
+                <option value="">Any method or second interest</option>
+                {% for a in area_options %}
+                <option value="{{ a.name }}" {% if method == a.name %}selected{% endif %}>{{ a.label }}</option>
                 {% endfor %}
             </select>
             <select name="scope">
@@ -991,6 +1000,7 @@ HTML_TEMPLATE = """
                 {% endfor %}
             </select>
             <button type="submit">Apply Filters</button>
+            <button type="button" class="secondary-button" id="reset-preferences">Reset</button>
         </form>
 
         {% if papers %}
@@ -1067,6 +1077,59 @@ HTML_TEMPLATE = """
         {% endif %}
     </div>
     <script>
+        const filterStorageKey = 'paperfeed.filters.v1';
+        const filterForm = document.querySelector('#filter-form');
+        const filterNames = ['topic', 'method', 'scope', 'source', 'sort', 'days'];
+
+        function readFiltersFromForm() {
+            const filters = {};
+            for (const name of filterNames) {
+                const field = filterForm.elements[name];
+                if (field && field.value) {
+                    filters[name] = field.value;
+                }
+            }
+            return filters;
+        }
+
+        function buildFilterQuery(filters) {
+            const params = new URLSearchParams();
+            for (const name of filterNames) {
+                if (filters[name]) {
+                    params.set(name, filters[name]);
+                }
+            }
+            return params.toString();
+        }
+
+        if (filterForm && !window.location.search) {
+            const savedFilters = localStorage.getItem(filterStorageKey);
+            if (savedFilters) {
+                try {
+                    const query = buildFilterQuery(JSON.parse(savedFilters));
+                    if (query) {
+                        window.location.replace(`${window.location.pathname}?${query}`);
+                    }
+                } catch {
+                    localStorage.removeItem(filterStorageKey);
+                }
+            }
+        }
+
+        filterForm?.addEventListener('submit', () => {
+            localStorage.setItem(filterStorageKey, JSON.stringify(readFiltersFromForm()));
+        });
+
+        document.querySelector('#reset-preferences')?.addEventListener('click', () => {
+            localStorage.removeItem(filterStorageKey);
+            for (const field of filterForm.elements) {
+                if (field.tagName === 'SELECT') {
+                    field.selectedIndex = 0;
+                }
+            }
+            filterForm.submit();
+        });
+
         const observer = new IntersectionObserver((entries) => {
             for (const entry of entries) {
                 if (entry.isIntersecting) {
@@ -1095,9 +1158,9 @@ async def index(
     config = load_config()
     if days not in config.other_lookback_options:
         days = config.lookback_days
-    if topic not in TOPIC_AREAS:
+    if topic not in config.areas:
         topic = ""
-    if method not in METHOD_AREAS:
+    if method not in config.areas:
         method = ""
     if scope not in {"high_impact_first", "high_impact_only", "all"}:
         scope = "high_impact_first"
@@ -1152,15 +1215,9 @@ async def index(
         other_papers = other_candidates[:remaining_slots]
 
     displayed_papers = high_impact_papers + other_papers
-    topic_options = [
+    area_options = [
         {"name": name, "label": _area_label(name)}
-        for name in TOPIC_AREAS
-        if name in config.areas
-    ]
-    method_options = [
-        {"name": name, "label": _area_label(name)}
-        for name in METHOD_AREAS
-        if name in config.areas
+        for name in config.areas
     ]
 
     env = Environment(autoescape=select_autoescape(["html", "xml"]))
@@ -1169,8 +1226,7 @@ async def index(
         papers=displayed_papers,
         high_impact_papers=high_impact_papers,
         other_papers=other_papers,
-        topics=topic_options,
-        methods=method_options,
+        area_options=area_options,
         topic=topic,
         method=method,
         scope=scope,
