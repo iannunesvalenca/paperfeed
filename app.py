@@ -23,6 +23,14 @@ class ResearchArea:
     terms: list[str]
     weight: float = 1.0
 
+@dataclass(frozen=True)
+class InterestFilter:
+    value: str
+    label: str
+    terms: tuple[str, ...]
+    area_name: str = ""
+    custom: bool = False
+
 @dataclass
 class Config:
     areas: dict[str, ResearchArea]
@@ -72,6 +80,7 @@ def load_config() -> Config:
 CACHE_TTL_SECONDS = 300
 _CACHE = {"timestamp": 0.0, "key": None, "papers": None}
 DISPLAY_LIMIT = 20
+MAX_INTEREST_LENGTH = 80
 
 # === Paper Model ===
 
@@ -178,7 +187,7 @@ def _build_pubmed_query(
     if terms:
         query_terms = []
         for term in terms:
-            cleaned = term.strip()
+            cleaned = " ".join(term.replace('"', " ").replace("[", " ").replace("]", " ").split())
             if not cleaned:
                 continue
             if " " in cleaned:
@@ -408,7 +417,7 @@ async def fetch_arxiv(days: int, max_results: int, categories: list[str], client
 
 # === Scoring ===
 
-def score_paper(paper: Paper, config: Config) -> Paper:
+def score_paper(paper: Paper, config: Config, interest_filters: Optional[list[InterestFilter]] = None) -> Paper:
     """Score a paper based on keyword matching."""
     title = paper.title.lower()
     abstract = paper.abstract.lower()
@@ -429,9 +438,29 @@ def score_paper(paper: Paper, config: Config) -> Paper:
             matched_areas.append(area_name)
             total_score += area_score * area.weight
 
+    for interest in interest_filters or []:
+        if not interest.custom:
+            continue
+
+        interest_score = _score_terms(title, abstract, interest.terms, config.title_multiplier)
+        if interest_score > 0:
+            total_score += interest_score
+
     paper.matched_areas = matched_areas
     paper.score = round(total_score, 1)
     return paper
+
+def _score_terms(title: str, abstract: str, terms: tuple[str, ...], title_multiplier: float) -> float:
+    score = 0.0
+    for term in terms:
+        term_lower = term.lower()
+        if not term_lower:
+            continue
+        if term_lower in title:
+            score += title_multiplier
+        if term_lower in abstract:
+            score += 1.0
+    return score
 
 def _normalize_journal(name: str) -> str:
     return "".join(ch for ch in name.lower() if ch.isalnum())
@@ -459,17 +488,81 @@ def is_high_impact(paper: Paper, config: Config) -> bool:
             return True
     return False
 
-def _collect_search_terms(config: Config) -> list[str]:
+def _collect_search_terms(config: Config, interest_filters: Optional[list[InterestFilter]] = None) -> list[str]:
     terms = []
     seen = set()
-    for area in config.areas.values():
+
+    if interest_filters:
+        candidate_terms = []
+        for interest in interest_filters:
+            candidate_terms.extend(interest.terms)
+    else:
+        candidate_terms = []
+        for area in config.areas.values():
+            candidate_terms.extend(area.terms)
+
+    for term in candidate_terms:
+        cleaned = term.strip()
+        if not cleaned or cleaned.lower() in seen:
+            continue
+        seen.add(cleaned.lower())
+        terms.append(cleaned)
+
+    return terms
+
+def _clean_interest_value(value: str) -> str:
+    return " ".join(value.split()).strip()[:MAX_INTEREST_LENGTH]
+
+def _area_aliases(config: Config) -> dict[str, str]:
+    aliases = {}
+    for area_name in config.areas:
+        label = _area_label(area_name)
+        aliases[area_name.lower()] = area_name
+        aliases[label.lower()] = area_name
+        aliases[area_name.replace("_", " ").lower()] = area_name
+    return aliases
+
+def _resolve_interest_filter(value: str, config: Config) -> Optional[InterestFilter]:
+    cleaned = _clean_interest_value(value)
+    if not cleaned:
+        return None
+
+    area_name = _area_aliases(config).get(cleaned.lower())
+    if area_name:
+        area = config.areas[area_name]
+        return InterestFilter(
+            value=_area_label(area_name),
+            label=_area_label(area_name),
+            terms=tuple(area.terms),
+            area_name=area_name,
+            custom=False,
+        )
+
+    return InterestFilter(
+        value=cleaned,
+        label=cleaned,
+        terms=(cleaned,),
+        custom=True,
+    )
+
+def _paper_matches_interest(paper: Paper, interest: InterestFilter) -> bool:
+    if interest.area_name:
+        return interest.area_name in paper.matched_areas
+
+    title = paper.title.lower()
+    abstract = paper.abstract.lower()
+    return any(term.lower() in title or term.lower() in abstract for term in interest.terms if term)
+
+def _area_options(config: Config) -> list[dict[str, str]]:
+    options = []
+    for name, area in config.areas.items():
+        label = _area_label(name)
+        options.append({"value": label, "label": label})
         for term in area.terms:
             cleaned = term.strip()
-            if not cleaned or cleaned.lower() in seen:
-                continue
-            seen.add(cleaned.lower())
-            terms.append(cleaned)
-    return terms
+            if cleaned:
+                options.append({"value": cleaned, "label": f"{cleaned} ({label})"})
+    return options
 
 def _area_label(area_name: str) -> str:
     labels = {
@@ -484,12 +577,23 @@ async def fetch_all_papers(config: Config) -> list[Paper]:
     """Fetch papers from all sources and score them."""
     return await fetch_all_papers_for_days(config, config.lookback_days, config.high_impact_lookback_days)
 
-async def fetch_all_papers_for_days(config: Config, lookback_days: int, high_impact_days: int) -> list[Paper]:
+async def fetch_all_papers_for_days(
+    config: Config,
+    lookback_days: int,
+    high_impact_days: int,
+    interest_filters: Optional[list[InterestFilter]] = None,
+) -> list[Paper]:
     """Fetch papers from all sources for a given lookback and score them."""
-    search_terms = _collect_search_terms(config)
+    interest_filters = interest_filters or []
+    search_terms = _collect_search_terms(config, interest_filters)
+    interest_cache_key = tuple(
+        (interest.label.lower(), interest.area_name, interest.custom, interest.terms)
+        for interest in interest_filters
+    )
     cache_key = (
         lookback_days,
         high_impact_days,
+        interest_cache_key,
         config.max_results,
         config.pubmed_enabled,
         config.biorxiv_enabled,
@@ -550,7 +654,7 @@ async def fetch_all_papers_for_days(config: Config, lookback_days: int, high_imp
                     all_papers.append(paper)
 
     # Score and filter
-    scored = [score_paper(p, config) for p in all_papers]
+    scored = [score_paper(p, config, interest_filters) for p in all_papers]
     relevant = [p for p in scored if p.score > 0]
 
     # Sort by score descending, then newest first.
@@ -711,23 +815,37 @@ HTML_TEMPLATE = """
             border: 1px solid var(--border);
         }
 
-        select {
+        select,
+        input[type="search"] {
             padding: 0.6rem 1rem;
             border: 1px solid var(--border);
             border-radius: 8px;
             font-size: 0.9rem;
             background: var(--card);
             color: var(--text);
-            cursor: pointer;
             transition: border-color 0.2s, background 0.2s;
         }
 
-        select:hover {
+        select {
+            cursor: pointer;
+        }
+
+        input[type="search"] {
+            min-width: 180px;
+        }
+
+        .interest-input {
+            flex: 1 1 190px;
+        }
+
+        select:hover,
+        input[type="search"]:hover {
             border-color: var(--accent);
             background: var(--card-hover);
         }
 
-        select:focus {
+        select:focus,
+        input[type="search"]:focus {
             outline: none;
             border-color: var(--accent);
             box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.15);
@@ -949,7 +1067,7 @@ HTML_TEMPLATE = """
                 flex-direction: column;
                 gap: 0.5rem;
             }
-            select, button { width: 100%; }
+            select, input[type="search"], button { width: 100%; }
             .paper-header { flex-direction: column; gap: 0.5rem; }
             .score { align-self: flex-start; }
             .authors { max-width: 100%; }
@@ -967,18 +1085,31 @@ HTML_TEMPLATE = """
         </header>
 
         <form class="controls" method="get" id="filter-form">
-            <select name="topic">
-                <option value="">Any interest</option>
+            <input
+                class="interest-input"
+                type="search"
+                name="topic"
+                list="area-options"
+                placeholder="Interest"
+                value="{{ topic }}"
+                maxlength="80"
+                autocomplete="off"
+            >
+            <input
+                class="interest-input"
+                type="search"
+                name="method"
+                list="area-options"
+                placeholder="Second interest or method"
+                value="{{ method }}"
+                maxlength="80"
+                autocomplete="off"
+            >
+            <datalist id="area-options">
                 {% for a in area_options %}
-                <option value="{{ a.name }}" {% if topic == a.name %}selected{% endif %}>{{ a.label }}</option>
+                <option value="{{ a.value }}">{{ a.label }}</option>
                 {% endfor %}
-            </select>
-            <select name="method">
-                <option value="">Any method or second interest</option>
-                {% for a in area_options %}
-                <option value="{{ a.name }}" {% if method == a.name %}selected{% endif %}>{{ a.label }}</option>
-                {% endfor %}
-            </select>
+            </datalist>
             <select name="scope">
                 <option value="high_impact_first" {% if scope == 'high_impact_first' %}selected{% endif %}>High-impact first</option>
                 <option value="high_impact_only" {% if scope == 'high_impact_only' %}selected{% endif %}>High-impact only</option>
@@ -1125,6 +1256,8 @@ HTML_TEMPLATE = """
             for (const field of filterForm.elements) {
                 if (field.tagName === 'SELECT') {
                     field.selectedIndex = 0;
+                } else if (field.tagName === 'INPUT') {
+                    field.value = '';
                 }
             }
             filterForm.submit();
@@ -1158,20 +1291,25 @@ async def index(
     config = load_config()
     if days not in config.other_lookback_options:
         days = config.lookback_days
-    if topic not in config.areas:
-        topic = ""
-    if method not in config.areas:
-        method = ""
     if scope not in {"high_impact_first", "high_impact_only", "all"}:
         scope = "high_impact_first"
 
-    papers = await fetch_all_papers_for_days(config, days, config.high_impact_lookback_days)
+    topic_filter = _resolve_interest_filter(topic, config)
+    method_filter = _resolve_interest_filter(method, config)
+    interest_filters = [interest for interest in (topic_filter, method_filter) if interest]
+    topic = topic_filter.value if topic_filter else ""
+    method = method_filter.value if method_filter else ""
 
-    # Filter by topic and method independently.
-    if topic:
-        papers = [p for p in papers if topic in p.matched_areas]
-    if method:
-        papers = [p for p in papers if method in p.matched_areas]
+    papers = await fetch_all_papers_for_days(
+        config,
+        days,
+        config.high_impact_lookback_days,
+        interest_filters,
+    )
+
+    # Filter by typed interests independently.
+    for interest in interest_filters:
+        papers = [p for p in papers if _paper_matches_interest(p, interest)]
 
     # Filter by source
     if source:
@@ -1215,10 +1353,7 @@ async def index(
         other_papers = other_candidates[:remaining_slots]
 
     displayed_papers = high_impact_papers + other_papers
-    area_options = [
-        {"name": name, "label": _area_label(name)}
-        for name in config.areas
-    ]
+    area_options = _area_options(config)
 
     env = Environment(autoescape=select_autoescape(["html", "xml"]))
     template = env.from_string(HTML_TEMPLATE)
