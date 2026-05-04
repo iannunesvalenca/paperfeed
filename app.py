@@ -1,7 +1,6 @@
 """Main FastAPI application for Vercel deployment."""
 
 import asyncio
-import re
 import time
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -87,11 +86,6 @@ class Paper:
     journal: str = ""
     matched_areas: list[str] = field(default_factory=list)
     score: float = 0.0
-    pmid: str = ""
-    doi: str = ""
-    arxiv_id: str = ""
-    notebooklm_url: str = ""
-    notebooklm_confidence: str = "low"
 
 # === Collectors ===
 
@@ -242,11 +236,6 @@ def _parse_pubmed_article(article: ET.Element) -> Optional[Paper]:
     url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else ""
     journal_title_elem = article_elem.find(".//Journal/Title")
     journal_title = "".join(journal_title_elem.itertext()).strip() if journal_title_elem is not None else ""
-    doi = ""
-    for article_id in article.findall(".//PubmedData/ArticleIdList/ArticleId"):
-        if article_id.attrib.get("IdType") == "doi" and article_id.text:
-            doi = article_id.text.strip()
-            break
 
     published = _parse_pubmed_date(article_elem, medline)
     return Paper(
@@ -257,8 +246,6 @@ def _parse_pubmed_article(article: ET.Element) -> Optional[Paper]:
         published_date=published,
         source="pubmed",
         journal=journal_title,
-        pmid=pmid,
-        doi=doi,
     )
 
 def _parse_pubmed_date(article_elem: ET.Element, medline: ET.Element) -> date:
@@ -360,7 +347,6 @@ async def fetch_biorxiv(days: int, max_results: int, client: httpx.AsyncClient) 
                     published_date=date.fromisoformat(item.get("date", str(date.today()))),
                     source="biorxiv",
                     journal="bioRxiv",
-                    doi=doi,
                 ))
             except Exception:
                 continue
@@ -384,7 +370,7 @@ async def fetch_arxiv(days: int, max_results: int, categories: list[str], client
             "sortOrder": "descending",
         }
 
-        resp = await client.get(url, params=params, timeout=8.0)
+        resp = await client.get(url, params=params)
         resp.raise_for_status()
 
         feed = feedparser.parse(resp.text)
@@ -404,7 +390,6 @@ async def fetch_arxiv(days: int, max_results: int, categories: list[str], client
                 if len(authors) > 5:
                     authors_str += " et al."
 
-                arxiv_id = _extract_arxiv_id(entry.get("id", "") or entry.get("link", ""))
                 papers.append(Paper(
                     title=entry.get("title", "").replace("\n", " ").strip(),
                     authors=authors_str,
@@ -413,7 +398,6 @@ async def fetch_arxiv(days: int, max_results: int, categories: list[str], client
                     published_date=pub_date,
                     source="arxiv",
                     journal="arXiv",
-                    arxiv_id=arxiv_id,
                 ))
             except Exception:
                 continue
@@ -421,96 +405,6 @@ async def fetch_arxiv(days: int, max_results: int, categories: list[str], client
         print(f"arXiv error: {e}")
 
     return papers
-
-# === NotebookLM Helpers ===
-
-def _extract_arxiv_id(value: str) -> str:
-    candidate = value.strip().split("?", 1)[0].rstrip("/")
-    if "/abs/" in candidate:
-        candidate = candidate.rsplit("/abs/", 1)[1]
-    elif "/pdf/" in candidate:
-        candidate = candidate.rsplit("/pdf/", 1)[1]
-    candidate = candidate.removesuffix(".pdf")
-    return re.sub(r"v\d+$", "", candidate)
-
-def _resolve_arxiv(arxiv_id: str) -> tuple[str, str]:
-    arxiv_id = _extract_arxiv_id(arxiv_id)
-    if not arxiv_id:
-        return "", "low"
-    return f"https://arxiv.org/pdf/{arxiv_id}", "high"
-
-def _resolve_biorxiv(doi: str) -> tuple[str, str]:
-    doi = doi.strip()
-    if not doi:
-        return "", "low"
-    return f"https://www.biorxiv.org/content/{doi}.full.pdf", "high"
-
-def _pubmed_landing_url(pmid: str) -> str:
-    return f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else ""
-
-async def _resolve_pubmed_pmc_chunk(pmids: list[str], client: httpx.AsyncClient) -> dict[str, tuple[str, str]]:
-    try:
-        response = await client.get(
-            "https://pmc.ncbi.nlm.nih.gov/tools/idconv/api/v1/articles/",
-            params={"ids": ",".join(pmids), "format": "json"},
-            timeout=4.0,
-        )
-        response.raise_for_status()
-        data = response.json()
-    except Exception as e:
-        print(f"PubMed PMC lookup failed: {e}")
-        return {}
-
-    resolved = {}
-    for record in data.get("records", []):
-        pmid = str(record.get("pmid") or record.get("requested-id") or "").strip()
-        pmcid = str(record.get("pmcid") or "").strip()
-        if pmid and pmcid:
-            resolved[pmid] = (f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmcid}/", "high")
-    return resolved
-
-async def _resolve_pubmed_batch(pmids: list[str], client: httpx.AsyncClient) -> dict[str, tuple[str, str]]:
-    unique_pmids = list(dict.fromkeys(pmid.strip() for pmid in pmids if pmid.strip()))
-    resolved = {pmid: (_pubmed_landing_url(pmid), "low") for pmid in unique_pmids}
-    chunks = [unique_pmids[i:i + 100] for i in range(0, len(unique_pmids), 100)]
-    if not chunks:
-        return resolved
-
-    results = await asyncio.gather(
-        *(_resolve_pubmed_pmc_chunk(chunk, client) for chunk in chunks),
-        return_exceptions=True,
-    )
-    for result in results:
-        if isinstance(result, dict):
-            resolved.update(result)
-    return resolved
-
-async def attach_notebooklm_urls(
-    papers: list[Paper],
-    client: Optional[httpx.AsyncClient] = None,
-    resolve_pubmed: bool = True,
-) -> None:
-    """Mutate papers in place with the best URL NotebookLM can ingest."""
-    pubmed_papers = []
-    for paper in papers:
-        if paper.notebooklm_url:
-            continue
-        if paper.source == "arxiv":
-            paper.notebooklm_url, paper.notebooklm_confidence = _resolve_arxiv(paper.arxiv_id or paper.url)
-        elif paper.source == "biorxiv":
-            paper.notebooklm_url, paper.notebooklm_confidence = _resolve_biorxiv(paper.doi)
-        elif paper.source == "pubmed" and resolve_pubmed and client is not None:
-            pubmed_papers.append(paper)
-
-    if not pubmed_papers:
-        return
-
-    resolved_pubmed = await _resolve_pubmed_batch([paper.pmid for paper in pubmed_papers], client)
-    for paper in pubmed_papers:
-        paper.notebooklm_url, paper.notebooklm_confidence = resolved_pubmed.get(
-            paper.pmid,
-            (_pubmed_landing_url(paper.pmid), "low"),
-        )
 
 # === Scoring ===
 
@@ -661,8 +555,6 @@ async def fetch_all_papers_for_days(config: Config, lookback_days: int, high_imp
 
     # Sort by score descending, then newest first.
     relevant.sort(key=lambda p: (p.score, p.published_date), reverse=True)
-
-    await attach_notebooklm_urls(relevant, resolve_pubmed=False)
 
     _CACHE["timestamp"] = now
     _CACHE["key"] = cache_key
@@ -945,7 +837,6 @@ HTML_TEMPLATE = """
             text-decoration: none;
             line-height: 1.4;
             transition: color 0.2s;
-            min-width: 0;
         }
 
         .paper-title:hover {
@@ -961,36 +852,6 @@ HTML_TEMPLATE = """
             font-size: 0.85rem;
             white-space: nowrap;
             box-shadow: 0 2px 8px rgba(46, 160, 67, 0.3);
-        }
-
-        .paper-actions {
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-            flex-shrink: 0;
-        }
-
-        .listen-btn {
-            padding: 0.25rem 0.6rem;
-            border-radius: 6px;
-            border: 1px solid var(--border);
-            background: var(--bg-secondary);
-            color: var(--text);
-            font-size: 0.8rem;
-            font-weight: 600;
-            cursor: pointer;
-            white-space: nowrap;
-            transition: border-color 0.2s, background 0.2s, color 0.2s;
-        }
-
-        .listen-btn:hover {
-            border-color: var(--accent);
-            background: var(--card-hover);
-            color: var(--accent);
-        }
-
-        .listen-btn[data-confidence="low"] {
-            color: var(--text-secondary);
         }
 
         .paper-meta {
@@ -1082,62 +943,6 @@ HTML_TEMPLATE = """
             color: var(--text-secondary);
         }
 
-        .toast {
-            position: fixed;
-            left: 50%;
-            bottom: 1.5rem;
-            transform: translateX(-50%);
-            max-width: min(90vw, 560px);
-            padding: 0.75rem 1rem;
-            border-radius: 8px;
-            border: 1px solid var(--border);
-            background: var(--card);
-            color: var(--text);
-            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
-            opacity: 0;
-            pointer-events: none;
-            transition: opacity 0.2s;
-            z-index: 1000;
-        }
-
-        .toast.show {
-            opacity: 1;
-        }
-
-        .toast.warn {
-            border-color: #d29922;
-        }
-
-        .copy-panel {
-            position: fixed;
-            left: 50%;
-            bottom: 5rem;
-            transform: translateX(-50%);
-            width: min(90vw, 620px);
-            display: grid;
-            grid-template-columns: 1fr auto;
-            gap: 0.75rem;
-            padding: 1rem;
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            background: var(--card);
-            box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
-            z-index: 1001;
-        }
-
-        .copy-panel[hidden] {
-            display: none;
-        }
-
-        .copy-panel input {
-            min-width: 0;
-            padding: 0.6rem 0.75rem;
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            background: var(--bg);
-            color: var(--text);
-        }
-
         @media (max-width: 640px) {
             .container { padding: 1rem; }
             .controls {
@@ -1146,9 +951,8 @@ HTML_TEMPLATE = """
             }
             select, button { width: 100%; }
             .paper-header { flex-direction: column; gap: 0.5rem; }
-            .paper-actions { align-self: flex-start; }
+            .score { align-self: flex-start; }
             .authors { max-width: 100%; }
-            .copy-panel { grid-template-columns: 1fr; }
         }
     </style>
 </head>
@@ -1209,18 +1013,7 @@ HTML_TEMPLATE = """
                             <a href="{{ paper.url }}" target="_blank" rel="noopener" class="paper-title">
                                 {{ paper.title }}
                             </a>
-                            <div class="paper-actions">
-                                {% if paper.notebooklm_url %}
-                                <button
-                                    type="button"
-                                    class="listen-btn"
-                                    data-url="{{ paper.notebooklm_url }}"
-                                    data-confidence="{{ paper.notebooklm_confidence }}"
-                                    title="Copy paper URL and open NotebookLM"
-                                >Listen</button>
-                                {% endif %}
-                                <span class="score">{{ paper.score }}</span>
-                            </div>
+                            <span class="score">{{ paper.score }}</span>
                         </div>
                         <div class="paper-meta">
                             <span class="source-badge source-{{ paper.source }}">{{ paper.source }}</span>
@@ -1255,18 +1048,7 @@ HTML_TEMPLATE = """
                         <a href="{{ paper.url }}" target="_blank" rel="noopener" class="paper-title">
                             {{ paper.title }}
                         </a>
-                        <div class="paper-actions">
-                            {% if paper.notebooklm_url %}
-                            <button
-                                type="button"
-                                class="listen-btn"
-                                data-url="{{ paper.notebooklm_url }}"
-                                data-confidence="{{ paper.notebooklm_confidence }}"
-                                title="Copy paper URL and open NotebookLM"
-                            >Listen</button>
-                            {% endif %}
-                            <span class="score">{{ paper.score }}</span>
-                        </div>
+                        <span class="score">{{ paper.score }}</span>
                     </div>
                     <div class="paper-meta">
                         <span class="source-badge source-{{ paper.source }}">{{ paper.source }}</span>
@@ -1294,20 +1076,10 @@ HTML_TEMPLATE = """
             </div>
         {% endif %}
     </div>
-    <div class="toast" id="toast" role="status" aria-live="polite"></div>
-    <div class="copy-panel" id="copy-panel" hidden>
-        <input id="copy-panel-url" type="text" readonly aria-label="NotebookLM source URL">
-        <button type="button" class="secondary-button" id="copy-panel-close">Close</button>
-    </div>
     <script>
         const filterStorageKey = 'paperfeed.filters.v1';
         const filterForm = document.querySelector('#filter-form');
         const filterNames = ['topic', 'method', 'scope', 'source', 'sort', 'days'];
-        const notebooklmHome = 'https://notebooklm.google.com/';
-        const toast = document.querySelector('#toast');
-        const copyPanel = document.querySelector('#copy-panel');
-        const copyPanelUrl = document.querySelector('#copy-panel-url');
-        let toastTimer;
 
         function readFiltersFromForm() {
             const filters = {};
@@ -1356,58 +1128,6 @@ HTML_TEMPLATE = """
                 }
             }
             filterForm.submit();
-        });
-
-        function showToast(message, warn = false) {
-            if (!toast) return;
-            clearTimeout(toastTimer);
-            toast.textContent = message;
-            toast.className = 'toast show' + (warn ? ' warn' : '');
-            toastTimer = setTimeout(() => {
-                toast.className = 'toast';
-            }, 3200);
-        }
-
-        function showCopyFallback(url) {
-            if (!copyPanel || !copyPanelUrl) return;
-            copyPanel.hidden = false;
-            copyPanelUrl.value = url;
-            copyPanelUrl.focus();
-            copyPanelUrl.select();
-        }
-
-        document.querySelector('#copy-panel-close')?.addEventListener('click', () => {
-            if (copyPanel) {
-                copyPanel.hidden = true;
-            }
-        });
-
-        document.addEventListener('click', async (event) => {
-            const button = event.target.closest('.listen-btn');
-            if (!button) return;
-
-            const url = button.dataset.url;
-            if (!url) return;
-
-            const tab = window.open(notebooklmHome, '_blank');
-            if (tab) {
-                tab.opener = null;
-            }
-
-            const lowConfidence = button.dataset.confidence === 'low';
-            try {
-                await navigator.clipboard.writeText(url);
-                const message = lowConfidence
-                    ? 'Landing page copied for NotebookLM. Full text may be limited.'
-                    : 'Paper URL copied for NotebookLM.';
-                showToast(
-                    tab ? message : `${message} Open NotebookLM manually.`,
-                    lowConfidence || !tab,
-                );
-            } catch {
-                showToast('Copy failed. Use the URL below.', true);
-                showCopyFallback(url);
-            }
         });
 
         const observer = new IntersectionObserver((entries) => {
@@ -1495,10 +1215,6 @@ async def index(
         other_papers = other_candidates[:remaining_slots]
 
     displayed_papers = high_impact_papers + other_papers
-    if any(p.source == "pubmed" and not p.notebooklm_url for p in displayed_papers):
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            await attach_notebooklm_urls(displayed_papers, client)
-
     area_options = [
         {"name": name, "label": _area_label(name)}
         for name in config.areas
