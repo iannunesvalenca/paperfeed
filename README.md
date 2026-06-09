@@ -1,6 +1,8 @@
 # PaperFeed
 
-A compact, self-hosted feed of recent research papers, ranked by topics you care about.
+A compact feed of recent research papers, ranked by topics you care about.
+
+**🔗 Live app: [paperfeed-app.vercel.app](https://paperfeed-app.vercel.app/)**
 
 PaperFeed pulls the latest papers from **PubMed**, **bioRxiv**, and **arXiv**, scores each
 one against keyword "areas" you define, and renders a single dark-themed page that separates
@@ -61,7 +63,8 @@ pip install -r requirements.txt
 uvicorn app:app --reload
 ```
 
-Then open http://127.0.0.1:8000.
+Then open http://127.0.0.1:8000 to view your local instance. (The public site runs at
+[paperfeed-app.vercel.app](https://paperfeed-app.vercel.app/).)
 
 Useful endpoints:
 
@@ -74,6 +77,9 @@ Useful endpoints:
 The repo uses Vercel's zero-config FastAPI support: it detects `requirements.txt` and the
 `app` ASGI variable in `app.py`. Import the repo into Vercel and deploy — no `vercel.json`
 needed. (`config.yaml` is read at runtime relative to `app.py`, so it ships with the function.)
+
+The production deployment lives at
+[paperfeed-app.vercel.app](https://paperfeed-app.vercel.app/).
 
 ## Limitations / ideas
 
