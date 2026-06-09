@@ -1,7 +1,9 @@
 """Main FastAPI application for Vercel deployment."""
 
 import asyncio
+import re
 import time
+from functools import lru_cache
 from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -45,6 +47,7 @@ class Config:
     high_impact_lookback_days: int
     other_lookback_options: list[int]
 
+@lru_cache(maxsize=1)
 def load_config() -> Config:
     config_path = Path(__file__).parent / "config.yaml"
     with open(config_path) as f:
@@ -173,8 +176,7 @@ async def _fetch_pubmed_with_query(
     days: int, max_results: int, terms: list[str], journals: Optional[list[str]], client: httpx.AsyncClient
 ) -> list[Paper]:
     """Wrapper that runs sync PubMed fetch in thread pool."""
-    import asyncio
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _fetch_pubmed_sync, days, max_results, terms, journals)
 
 def _build_pubmed_query(
@@ -417,10 +419,27 @@ async def fetch_arxiv(days: int, max_results: int, categories: list[str], client
 
 # === Scoring ===
 
+@lru_cache(maxsize=4096)
+def _term_pattern(term: str) -> "re.Pattern[str]":
+    """Compile a case-insensitive, word-start-anchored matcher for a term.
+
+    Anchoring at a leading word boundary keeps prefix matches that we want
+    (``virus`` -> ``viruses``) while avoiding spurious substring hits for short
+    acronyms (``NGS`` no longer matches inside ``amongst``).
+    """
+    return re.compile(r"\b" + re.escape(term.strip()), re.IGNORECASE)
+
+
+def _text_contains_term(text: str, term: str) -> bool:
+    if not term or not term.strip():
+        return False
+    return _term_pattern(term).search(text) is not None
+
+
 def score_paper(paper: Paper, config: Config, interest_filters: Optional[list[InterestFilter]] = None) -> Paper:
     """Score a paper based on keyword matching."""
-    title = paper.title.lower()
-    abstract = paper.abstract.lower()
+    title = paper.title
+    abstract = paper.abstract
 
     matched_areas = []
     total_score = 0.0
@@ -428,10 +447,9 @@ def score_paper(paper: Paper, config: Config, interest_filters: Optional[list[In
     for area_name, area in config.areas.items():
         area_score = 0.0
         for term in area.terms:
-            term_lower = term.lower()
-            if term_lower in title:
+            if _text_contains_term(title, term):
                 area_score += config.title_multiplier
-            if term_lower in abstract:
+            if _text_contains_term(abstract, term):
                 area_score += 1.0
 
         if area_score > 0:
@@ -453,12 +471,11 @@ def score_paper(paper: Paper, config: Config, interest_filters: Optional[list[In
 def _score_terms(title: str, abstract: str, terms: tuple[str, ...], title_multiplier: float) -> float:
     score = 0.0
     for term in terms:
-        term_lower = term.lower()
-        if not term_lower:
+        if not term or not term.strip():
             continue
-        if term_lower in title:
+        if _text_contains_term(title, term):
             score += title_multiplier
-        if term_lower in abstract:
+        if _text_contains_term(abstract, term):
             score += 1.0
     return score
 
@@ -549,9 +566,10 @@ def _paper_matches_interest(paper: Paper, interest: InterestFilter) -> bool:
     if interest.area_name:
         return interest.area_name in paper.matched_areas
 
-    title = paper.title.lower()
-    abstract = paper.abstract.lower()
-    return any(term.lower() in title or term.lower() in abstract for term in interest.terms if term)
+    return any(
+        _text_contains_term(paper.title, term) or _text_contains_term(paper.abstract, term)
+        for term in interest.terms if term
+    )
 
 def _area_options(config: Config) -> list[dict[str, str]]:
     options = []
@@ -572,10 +590,6 @@ def _area_label(area_name: str) -> str:
     return labels.get(area_name, area_name.replace("_", " ").title())
 
 # === Main Fetch Function ===
-
-async def fetch_all_papers(config: Config) -> list[Paper]:
-    """Fetch papers from all sources and score them."""
-    return await fetch_all_papers_for_days(config, config.lookback_days, config.high_impact_lookback_days)
 
 async def fetch_all_papers_for_days(
     config: Config,
@@ -700,6 +714,32 @@ async def icon():
     return Response(content=svg, media_type="image/svg+xml")
 
 HTML_TEMPLATE = """
+{% macro paper_card(paper) %}
+<article class="paper" style="--area-color: var(--area-{{ paper.matched_areas[0] if paper.matched_areas else 'default' }}, var(--accent))">
+    <div class="paper-header">
+        <a href="{{ paper.url }}" target="_blank" rel="noopener" class="paper-title">
+            {{ paper.title }}
+        </a>
+        <span class="score">{{ paper.score }}</span>
+    </div>
+    <div class="paper-meta">
+        <span class="source-badge source-{{ paper.source }}">{{ paper.source }}</span>
+        {% if paper.journal %}
+        <span class="journal">{{ paper.journal }}</span>
+        {% endif %}
+        <span class="authors">{{ paper.authors }}</span>
+        <span class="date">{{ paper.published_date }}</span>
+    </div>
+    {% if paper.matched_areas %}
+    <div class="areas">
+        {% for a in paper.matched_areas %}
+        <span class="area-tag area-{{ a }}">{{ a.replace('_', ' ') }}</span>
+        {% endfor %}
+    </div>
+    {% endif %}
+    <p class="abstract">{{ paper.abstract }}</p>
+</article>
+{% endmacro %}
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1139,30 +1179,7 @@ HTML_TEMPLATE = """
             <div class="papers">
                 {% if high_impact_papers %}
                     {% for paper in high_impact_papers %}
-                    <article class="paper" style="--area-color: var(--area-{{ paper.matched_areas[0] if paper.matched_areas else 'default' }}, var(--accent))">
-                        <div class="paper-header">
-                            <a href="{{ paper.url }}" target="_blank" rel="noopener" class="paper-title">
-                                {{ paper.title }}
-                            </a>
-                            <span class="score">{{ paper.score }}</span>
-                        </div>
-                        <div class="paper-meta">
-                            <span class="source-badge source-{{ paper.source }}">{{ paper.source }}</span>
-                            {% if paper.journal %}
-                            <span class="journal">{{ paper.journal }}</span>
-                            {% endif %}
-                            <span class="authors">{{ paper.authors }}</span>
-                            <span class="date">{{ paper.published_date }}</span>
-                        </div>
-                        {% if paper.matched_areas %}
-                        <div class="areas">
-                            {% for a in paper.matched_areas %}
-                            <span class="area-tag area-{{ a }}">{{ a.replace('_', ' ') }}</span>
-                            {% endfor %}
-                        </div>
-                        {% endif %}
-                        <p class="abstract">{{ paper.abstract }}</p>
-                    </article>
+                    {{ paper_card(paper) }}
                     {% endfor %}
                 {% else %}
                     <div class="empty">
@@ -1174,30 +1191,7 @@ HTML_TEMPLATE = """
             <div class="section-title">Other papers <span>{{ other_papers|length }} papers</span></div>
             <div class="papers">
                 {% for paper in other_papers %}
-                <article class="paper" style="--area-color: var(--area-{{ paper.matched_areas[0] if paper.matched_areas else 'default' }}, var(--accent))">
-                    <div class="paper-header">
-                        <a href="{{ paper.url }}" target="_blank" rel="noopener" class="paper-title">
-                            {{ paper.title }}
-                        </a>
-                        <span class="score">{{ paper.score }}</span>
-                    </div>
-                    <div class="paper-meta">
-                        <span class="source-badge source-{{ paper.source }}">{{ paper.source }}</span>
-                        {% if paper.journal %}
-                        <span class="journal">{{ paper.journal }}</span>
-                        {% endif %}
-                        <span class="authors">{{ paper.authors }}</span>
-                        <span class="date">{{ paper.published_date }}</span>
-                    </div>
-                    {% if paper.matched_areas %}
-                    <div class="areas">
-                        {% for a in paper.matched_areas %}
-                        <span class="area-tag area-{{ a }}">{{ a.replace('_', ' ') }}</span>
-                        {% endfor %}
-                    </div>
-                    {% endif %}
-                    <p class="abstract">{{ paper.abstract }}</p>
-                </article>
+                {{ paper_card(paper) }}
                 {% endfor %}
             </div>
         {% else %}
@@ -1278,6 +1272,10 @@ HTML_TEMPLATE = """
 </html>
 """
 
+_jinja_env = Environment(autoescape=select_autoescape(["html", "xml"]))
+_template = _jinja_env.from_string(HTML_TEMPLATE)
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index(
     request: Request,
@@ -1355,9 +1353,7 @@ async def index(
     displayed_papers = high_impact_papers + other_papers
     area_options = _area_options(config)
 
-    env = Environment(autoescape=select_autoescape(["html", "xml"]))
-    template = env.from_string(HTML_TEMPLATE)
-    html = template.render(
+    html = _template.render(
         papers=displayed_papers,
         high_impact_papers=high_impact_papers,
         other_papers=other_papers,
