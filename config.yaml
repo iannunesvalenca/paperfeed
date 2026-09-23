@@ -1,6 +1,7 @@
 sources:
   pubmed: true
   biorxiv: true
+  medrxiv: true   # clinical/epidemiology preprints (same API as bioRxiv)
   arxiv:
     enabled: true
     categories:
