@@ -82,6 +82,7 @@ areas:
       - pipeline
       - workflow
       - sequence alignment
+    weight: 1.0
 
 scoring:
   title_multiplier: 2.0

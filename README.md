@@ -89,8 +89,9 @@ Offline development and tests (no network access to the sources needed):
 pip install -r requirements-dev.txt
 python -m pytest tests
 python tests/mock_server.py   # generated papers at http://127.0.0.1:8000
-``` (The public site runs at
-[paperfeed-app.vercel.app](https://paperfeed-app.vercel.app/).)
+```
+
+The public site runs at [paperfeed-app.vercel.app](https://paperfeed-app.vercel.app/).
 
 Useful endpoints:
 
@@ -112,5 +113,9 @@ The production deployment lives at
 
 - The in-memory cache resets on every cold start; a shared cache (e.g. Vercel KV) would make it
   more effective across invocations.
-- bioRxiv is fetched a single page at a time, so very high `max_results` values won't all arrive.
+- bioRxiv and medRxiv fetching is capped at 8 pages (800 items) per request to keep serverless latency low.
 - Scoring is keyword-based; an embedding-based relevance pass could improve ranking quality.
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).
